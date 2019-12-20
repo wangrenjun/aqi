@@ -68,7 +68,7 @@ func init() {
     viper.SetConfigFile(configPath)
     if err := viper.ReadInConfig(); err != nil {
         if _, ok := err.(*os.PathError); !ok {
-            fmt.Fprintf(os.Stderr, "%s: Fatal error config file: %v\n", basename, err)
+            fmt.Fprintf(os.Stderr, "%s: Fatal error config file: %s\n", basename, err)
         }
     }
     zhcn = viper.GetBool("zhcn")
