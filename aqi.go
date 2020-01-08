@@ -11,6 +11,7 @@ import (
     "os/user"
     "io/ioutil"
     "path/filepath"
+    "sync"
     "github.com/tidwall/gjson"
     "github.com/spf13/viper"
     "github.com/mattn/go-runewidth"
@@ -21,6 +22,7 @@ const rcFile = "~/.aqirc"
 const urlCityFeed = "https://api.waqi.info/feed/"
 const urlSearch = "https://api.waqi.info/search/"
 const rightJustifiedWidth = 50
+const rightJustifiedWidthInZh = 30
 
 type StringSlice []string
 
@@ -62,7 +64,6 @@ func IsInteger(s string) bool {
 func init() {
     basename = filepath.Base(os.Args[0])
     viper.SetDefault("zhcn", false)
-    viper.SetDefault("cities", "here")
     viper.SetConfigType("toml")
     configPath, _ := ExpandTildeToHomeDir(rcFile)
     viper.SetConfigFile(configPath)
@@ -96,6 +97,9 @@ func init() {
     }
     if len(flagKeywords) > 0 {
         keywords = flagKeywords
+    }
+    if len(cities) == 0 && len(keywords) == 0 {
+        cities = append(cities, "here")
     }
     if token == "" {
         fmt.Println("Must pass token")
@@ -141,7 +145,7 @@ func colored(fg int, text string) string {
     }
 }
 
-func prettyCityFeed(parsedJson gjson.Result) {
+func prettyCityFeed(parsedJson *gjson.Result) {
     aqi := parsedJson.Get("data.aqi").Float()
     i := 0
     for ; i < len(aqiColorChart) - 1; i++ {
@@ -153,7 +157,7 @@ func prettyCityFeed(parsedJson gjson.Result) {
     for _, it := range cityFeedResponseMappingTable {
         if parsedJson.Get(it[0]).Exists() {
             if zhcn {
-                fmt.Printf("%s: %s\n", runewidth.FillLeft(colored(fg, it[2]), rightJustifiedWidth), colored(fg, parsedJson.Get(it[0]).String()))
+                fmt.Printf("%s: %s\n", runewidth.FillLeft(colored(fg, it[2]), rightJustifiedWidthInZh), colored(fg, parsedJson.Get(it[0]).String()))
             } else {
                 fmt.Printf("%*s: %s\n", rightJustifiedWidth, colored(fg, it[1]), colored(fg, parsedJson.Get(it[0]).String()))
             }
@@ -162,70 +166,115 @@ func prettyCityFeed(parsedJson gjson.Result) {
     fmt.Println()
 }
 
-func apiCityFeed(city string) error {
+func apiCityFeed(city string) (*gjson.Result, error) {
     if IsInteger(city) {
         city = "@" + city
     }
     response, err := http.Get(urlCityFeed + city + "/?token=" + token)
     if err != nil {
-		return err
+		return nil, err
 	}
     defer response.Body.Close()
     bytes, err := ioutil.ReadAll(response.Body)
     if err != nil {
-        return err
+        return nil, err
     }
     parsedJson := gjson.Parse(string(bytes))
     if !parsedJson.Get("status").Exists() {
-        return errUnexpectedResponseFormat
+        return nil, errUnexpectedResponseFormat
     }
     if parsedJson.Get("status").Value().(string) != "ok" {
-        return errors.New(parsedJson.Get("data").Value().(string))
+        return nil, errors.New(parsedJson.Get("data").Value().(string))
     }
     if !parsedJson.Get("data.city.name").Exists() || !parsedJson.Get("data.aqi").Exists() {
-        return errUnexpectedResponseFormat
+        return nil, errUnexpectedResponseFormat
     }
-    prettyCityFeed(parsedJson)
-    return nil
+    return &parsedJson, nil
 }
 
-func apiSearch(keyword string) error {
+func apiSearch(keyword string) ([]*gjson.Result, []error) {
+    var outsl []*gjson.Result
+    var errsl []error
     response, err := http.Get(urlSearch + "/?token=" + token + "&keyword=" + keyword)
     if err != nil {
-		return err
+        errsl = append(errsl, err)
+		return outsl, errsl
 	}
     defer response.Body.Close()
     bytes, err := ioutil.ReadAll(response.Body)
     if err != nil {
-        return err
+        errsl = append(errsl, err)
+        return outsl, errsl
     }
     parsedJson := gjson.Parse(string(bytes))
     if !parsedJson.Get("status").Exists() {
-        return errUnexpectedResponseFormat
+        errsl = append(errsl, errUnexpectedResponseFormat)
+        return outsl, errsl
     }
     if parsedJson.Get("status").Value().(string) != "ok" {
-        return errors.New(parsedJson.Get("data").Value().(string))
+        errsl = append(errsl, errors.New(parsedJson.Get("data").Value().(string)))
+        return outsl, errsl
     }
     if !parsedJson.Get("data").Exists() {
-        return errUnexpectedResponseFormat
+        errsl = append(errsl, errUnexpectedResponseFormat)
+        return outsl, errsl
     }
     for _, st := range parsedJson.Get("data").Array() {
-        if err := apiCityFeed(st.Get("uid").String()); err != nil {
-            fmt.Fprintf(os.Stderr, "%s: %s\n", basename, err)
+        if out, err := apiCityFeed(st.Get("uid").String()); err != nil {
+            errsl = append(errsl, err)
+        } else {
+            outsl = append(outsl, out)
         }
     }
-    return nil
+    return outsl, errsl
 }
 
 func main() {
-    for _, c := range cities {
-        if err := apiCityFeed(c); err != nil {
-            fmt.Fprintf(os.Stderr, "%s: %s\n", basename, err)
+    var wg sync.WaitGroup
+    chout := make(chan *gjson.Result)
+    cherr := make(chan error)
+
+    cityWorker := func(city string) {
+        if out, err := apiCityFeed(city); err != nil {
+            cherr <- err
+        } else {
+            chout <- out
         }
+        wg.Done()
     }
-    for _, k := range keywords {
-        if err := apiSearch(k); err != nil {
+    for _, city := range cities {
+        wg.Add(1)
+        go cityWorker(city)
+    }
+
+    searchWorker := func(keyword string) {
+        outsl, errsl := apiSearch(keyword)
+        for _, o := range outsl {
+            chout <- o
+        }
+        for _, e := range errsl {
+            cherr <- e
+        }
+        wg.Done()
+    }
+    for _, keyword := range keywords {
+        wg.Add(1)
+        go searchWorker(keyword)
+    }
+
+    done := make(chan struct{})
+    go func() {
+        wg.Wait()
+        done <- struct{}{}
+    }()
+    for {
+        select {
+        case out := <-chout:
+            prettyCityFeed(out)
+        case err := <-cherr:
             fmt.Fprintf(os.Stderr, "%s: %s\n", basename, err)
+        case <-done:
+            return
         }
     }
 }
